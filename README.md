@@ -1,7 +1,7 @@
 ## 실행 방법
 root directory(C-LGN)에서 
 ```bash
-python -m convdifflogic_pytorch.train_example --dataset mnist --epochs - 1 --k 8
+python -m convdifflogic_pytorch.train_example --dataset mnist --epochs 1 --k 8
 ```
 입력해서 실행한다.
 
