@@ -141,7 +141,7 @@ class LogicTreeConvConfig:
 
 class LogicTreeConv2d(nn.Module):
     """
-    Convolutional logic gate tree layer (NeurIPS'24 CDLGN):
+    Convolutional logic gate tree layer:
 
     - Each output channel has a *fixed* random selection of inputs (leaves) from the receptive field.
     - Each output channel is parameterized by a complete binary tree of depth d:
@@ -174,6 +174,7 @@ class LogicTreeConv2d(nn.Module):
         self.num_nodes = self.num_leaves - 1
 
         # --- Random fixed leaf connections (which inputs inside the patch are used as leaves) ---
+        # leaf_indices의 shape은 (out_channels, num_leaves) 형태이다.
         leaf_indices = self._init_leaf_indices(
             in_channels=self.in_channels,
             out_channels=self.out_channels,
@@ -224,22 +225,31 @@ class LogicTreeConv2d(nn.Module):
         gen.manual_seed(int(seed))
 
         patch_len = in_channels * kh * kw
+        # leaf_indices[oc, leaf_id]는 oc번째 출력 트리(채널)의 leaf_id번째 leaf가 볼 입력 위치 의미
         leaf_indices = torch.empty(out_channels, num_leaves, dtype=torch.long)
 
+        # 각 출력 채널마다 1개의 로직 트리가 생긴다.
         for oc in range(out_channels):
             if in_channels_per_tree is None or in_channels_per_tree >= in_channels:
                 allowed_channels = torch.arange(in_channels, dtype=torch.long)
             else:
                 # sample a subset of channels for this tree
+                # 각 출력 마다 로직 트리가 선택하는 receptive field의 in_channels 개수는 in_channels_per_tree만큼 고정되어있다.
+                # 예를 들어 in_channels의 개수가 8개이면 그 중 2개(inchannels_per_tree)만 뽑혀서 로직 트리 리프 노드의 인덱스 후보가 된다.
                 perm = torch.randperm(in_channels, generator=gen)[: int(in_channels_per_tree)]
                 allowed_channels = perm.to(torch.long)
 
             # For each leaf pick (channel, dy, dx).
             # (Channel is chosen from allowed_channels.)
+            # torch.randint(low, high, size) 가 기본이고 low <= 값 < high 범위의 정수를 size만큼 뽑아서 1D 텐서를 반환한다.
+            # torch.randint(high, sizem, ...) 처럼 low를 생략하면 자동으로 0부터 뽑는다. 아래를 그런 방식으로 사용했다.
             ch_sel = allowed_channels[torch.randint(len(allowed_channels), (num_leaves,), generator=gen)]
             dy = torch.randint(kh, (num_leaves,), generator=gen)
             dx = torch.randint(kw, (num_leaves,), generator=gen)
 
+            # patch를 펼친 순서는  채널 0의 (kh*kw)개 먼저 그 다음 채널 1의 (kh*kw) ... 식으로 펼쳐진다.
+            # 또 각 채널 내부의 (kh,kw) 는 row-major (dy, dx) --> dy*kw + dx
+            # 즉 어떤 (channel, dy, dx)가 펼친 벡터에서 차지하는 index = channel*(kw*kh) + dy*kw + dx
             leaf_indices[oc] = ch_sel * (kh * kw) + dy * kw + dx
 
         # sanity
@@ -272,6 +282,8 @@ class LogicTreeConv2d(nn.Module):
         B2, patch_len, L = patches.shape
 
         # Gather leaves: advanced indexing yields (B, out_channels, num_leaves, L)
+        # patches : (B, C*kh*kw, L)
+        # self.leaf_indices의 shape은 (out_channels, num_leaves) 형태이다.
         leaves = patches[:, self.leaf_indices, :]
 
         # Compute tree bottom-up. We store logits in "level order" from bottom to top:
@@ -284,11 +296,12 @@ class LogicTreeConv2d(nn.Module):
             node_count = width // 2
             a = cur[:, :, 0::2, :]  # (B, out_channels, node_count, L)
             b = cur[:, :, 1::2, :]
+            # self.logits의 shape은 (out_channels, num_nodes, 16)
             level_logits = self.logits[:, node_ptr: node_ptr + node_count, :]  # (out_channels, node_count, 16)
 
             gate_probs = logits_to_gate_probs(level_logits, training=self.training)
             # Broadcast to (B, out_channels, node_count, L, 16):
-            gate_probs = gate_probs.unsqueeze(0).unsqueeze(-2)  # (1, out_channels, node_count, 1, 16)
+            gate_probs = gate_probs.unsqueeze(0).unsqueeze(-2)  # (1, out_channels, node_count, 1, 16) --> unsqueeze(dim)은 해당 위치에 크기 1인 차원을 넣는다.
 
             # bin_op_s expects gate_probs broadcastable to a/b.
             out = bin_op_s(a, b, gate_probs)  # (B, out_channels, node_count, L)

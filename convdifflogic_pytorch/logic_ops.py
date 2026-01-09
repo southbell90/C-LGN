@@ -1,18 +1,10 @@
 
-"""
-Pure PyTorch implementation utilities for Differentiable Logic Gate Networks (DLGNs)
-and Convolutional Differentiable Logic Gate Networks (CDLGNs).
-
-This file contains the 16 probabilistic (real-valued) relaxations of binary logic gates
-used in Petersen et al. (NeurIPS'22/'24).
-"""
-
 from __future__ import annotations
 
 import torch
 
 
-# Gate IDs follow the mapping used in the original DiffLogic code / NeurIPS'22 paper:
+# Gate IDs follow the mapping used in the original DiffLogic code:
 # 0: False
 # 1: AND
 # 2: not(A => B)  == A - A*B
@@ -81,12 +73,16 @@ def bin_op_s(a: torch.Tensor, b: torch.Tensor, gate_probs: torch.Tensor) -> torc
     Returns:
         Tensor with the same shape as a/b.
     """
+    # LogicTreeConv2d의 gate_probs의 shape은 (1, out_channels, node_count, 1, 16)
     if gate_probs.shape[-1] != 16:
         raise ValueError(f"gate_probs last dim must be 16, got {gate_probs.shape[-1]}")
 
+    # LogicTreeConv2d의 a의 shape은 (B, out_channels, node_count, L)
     r = torch.zeros_like(a)
     # Not optimized: explicit loop is fine for a reference implementation.
     for i in range(16):
+        # gate_probs[..., i]는 마지막 차원(16)에서 i만 뽑으므로 (1, out_channels, node_count, 1) 이 된다.
+        # gate_probs가 boradcast된다.
         r = r + gate_probs[..., i] * bin_op(a, b, i)
     return r
 
@@ -108,9 +104,10 @@ def logits_to_gate_probs(
 
 
 def residual_init_logits(
+    # LogicTreeConv2d 에서는 shape이 (out_channels, num_nodes, 16)
     shape: tuple[int, ...],
-    *,
-    gate_id: int = 3,
+    *,  # 여기부터 뒤에 나오는 파라미터들은 위치 인자로 못 받고 키워드 인자로만 받는다.
+    gate_id: int = 3,   # 3번 로직 게이트는 입력 a를 그대로 흘려 보낸다.
     z_value: float = 5.0,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float32,
