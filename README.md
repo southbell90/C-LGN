@@ -5,6 +5,13 @@ python -m convdifflogic_pytorch.train_example --dataset mnist --epochs 1 --k 8
 ```
 입력해서 실행한다.
 
+## CUDA extension 빌드 (최적화)
+```bash
+pip install -e .
+```
+을 사용해 설치하고 실행하면 CUDA extension이 기본 적용된다.
+CUDA extension이 없으면 자동으로 vanilla pytorch 구현이 사용된다.
+
 CUDA Extension을 끄고 싶으면
 ```bash
 CONVDIFFLOGIC_DISABLE_CUDA_EXT=1 python -m convdifflogic_pytorch.train_example --dataset mnist --epochs 1 --k 8
