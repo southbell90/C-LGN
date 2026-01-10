@@ -372,7 +372,7 @@ class LogicTreeConv2d(nn.Module):
                 width = node_count
 
             # Root: (OC, 1, B, L) -> (B, OC, L)
-            y = cur.squeeze(1).permute(2, 0, 1).contiguous()
+            y = cur.squeeze(1).permute(1, 0, 2).contiguous()
 
             H_padded = H + 2 * self.padding
             W_padded = W + 2 * self.padding
