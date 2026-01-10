@@ -1,3 +1,6 @@
 c-lgn-env/
 data/
 __pycache__/
+build/
+convdifflogic_pytorch.egg-info/
+convdifflogic_cuda.cpython-*

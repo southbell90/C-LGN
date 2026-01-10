@@ -10,6 +10,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .logic_ops import bin_op_s, logits_to_gate_probs, residual_init_logits
+from .cuda_ops import (
+    CSRConnections,
+    build_csr_connections,
+    cuda_extension_available,
+    logic_layer_cuda,
+    prepare_pairwise_connections,
+)
 
 
 def _pairwise_random_connections(in_dim: int, out_dim: int, *, generator: Optional[torch.Generator] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -72,6 +79,12 @@ class DifferentiableLogicLayer(nn.Module):
         self.register_buffer("a_idx", a_idx)
         self.register_buffer("b_idx", b_idx)
 
+        # Precompute CSR adjacency lists used by the CUDA backward kernel.
+        # These will be moved automatically with .to(device) because they are buffers.
+        csr = build_csr_connections(self.a_idx, self.b_idx, in_dim=self.in_dim, out_dim=self.out_dim)
+        self.register_buffer("given_x_indices_of_y_start", csr.start)
+        self.register_buffer("given_x_indices_of_y", csr.indices)
+
         if residual_init:
             logits = residual_init_logits((self.out_dim, 16), gate_id=residual_gate_id, z_value=residual_z, device=device, dtype=dtype)
         else:
@@ -93,15 +106,26 @@ class DifferentiableLogicLayer(nn.Module):
         if x.shape[-1] != self.in_dim:
             raise ValueError(f"Expected last dim {self.in_dim}, got {x.shape[-1]}")
 
+        # --- CUDA fast path -------------------------------------------------
+        # Uses the fused CUDA kernel from the original difflogic implementation.
+        if (
+            x.is_cuda
+            and cuda_extension_available()
+            and x.dtype in (torch.float16, torch.float32)
+        ):
+            # CUDA kernel expects (in_dim, batch) layout.
+            x_t = x.transpose(0, 1).contiguous()  # (in_dim, B)
+            w = logits_to_gate_probs(self.logits, training=self.training).to(dtype=x_t.dtype).contiguous()  # (out_dim,16)
+            csr = CSRConnections(self.given_x_indices_of_y_start, self.given_x_indices_of_y)
+            y_t = logic_layer_cuda(x_t, self.a_idx, self.b_idx, w, csr)  # (out_dim, B)
+            return y_t.transpose(0, 1)
+
+        # --- Pure PyTorch fallback -----------------------------------------
         a = x[:, self.a_idx]
         b = x[:, self.b_idx]
-
         gate_probs = logits_to_gate_probs(self.logits, training=self.training)  # (out_dim, 16)
-
-        # Broadcast to (B, out_dim, 16) so the last dim is the gate dim.
-        gate_probs = gate_probs.unsqueeze(0)
-        y = bin_op_s(a, b, gate_probs)
-        return y
+        gate_probs = gate_probs.unsqueeze(0)  # (1, out_dim, 16)
+        return bin_op_s(a, b, gate_probs)
 
 
 class GroupSum(nn.Module):
@@ -200,6 +224,27 @@ class LogicTreeConv2d(nn.Module):
 
         self.logits = nn.Parameter(logits)
 
+        # --- Precompute tree-level pairwise connections for the CUDA fast path ---
+        # Each tree level is a grouped 2-input logic-gate layer with a deterministic
+        # "(0,1), (2,3), ..." pairing within each output channel.
+        #
+        # The fused CUDA kernel expects a CSR adjacency representation for the backward.
+        width = self.num_leaves
+        for level in range(self.tree_depth):
+            node_count = width // 2
+            in_dim_level = self.out_channels * width
+            out_dim_level = self.out_channels * node_count
+
+            a_idx_l, b_idx_l = prepare_pairwise_connections(out_groups=self.out_channels, width=width)
+            csr_l = build_csr_connections(a_idx_l, b_idx_l, in_dim=in_dim_level, out_dim=out_dim_level)
+
+            self.register_buffer(f"cuda_a_idx_l{level}", a_idx_l)
+            self.register_buffer(f"cuda_b_idx_l{level}", b_idx_l)
+            self.register_buffer(f"cuda_given_start_l{level}", csr_l.start)
+            self.register_buffer(f"cuda_given_indices_l{level}", csr_l.indices)
+
+            width = node_count
+
     @staticmethod
     def _init_leaf_indices(
         *,
@@ -285,6 +330,55 @@ class LogicTreeConv2d(nn.Module):
         # patches : (B, C*kh*kw, L)
         # self.leaf_indices의 shape은 (out_channels, num_leaves) 형태이다.
         leaves = patches[:, self.leaf_indices, :]
+
+        # --- CUDA fast path -------------------------------------------------
+        # The expensive part of this layer is repeatedly applying the 16-gate mixture
+        # at every tree node. The original difflogic repo provides a fused CUDA kernel
+        # for a sparse 2-input logic layer. We can map each tree level to such a logic
+        # layer by treating each (out_channel, node) as an independent neuron and
+        # flattening the spatial positions (L) into the batch dimension.
+        if (
+            leaves.is_cuda
+            and cuda_extension_available()
+            and leaves.dtype in (torch.float16, torch.float32)
+        ):
+            OC = self.out_channels
+            # Keep the intermediate in (OC, width, B, L) contiguous layout so that
+            # each feature (oc, width_idx) is contiguous across the flattened samples.
+            cur = leaves.permute(1, 2, 0, 3).contiguous()  # (OC, width, B, L)
+            node_ptr = 0
+            width = self.num_leaves
+
+            for level in range(self.tree_depth):
+                node_count = width // 2
+
+                level_logits = self.logits[:, node_ptr : node_ptr + node_count, :]  # (OC, node_count, 16)
+                w = logits_to_gate_probs(level_logits, training=self.training)
+                w = w.reshape(OC * node_count, 16).to(dtype=cur.dtype).contiguous()
+
+                # Flatten (B, L) into the batch dimension.
+                x_t = cur.reshape(OC * width, B * L)  # (in_dim, batch)
+
+                a_idx = getattr(self, f"cuda_a_idx_l{level}")
+                b_idx = getattr(self, f"cuda_b_idx_l{level}")
+                start = getattr(self, f"cuda_given_start_l{level}")
+                idx = getattr(self, f"cuda_given_indices_l{level}")
+                csr = CSRConnections(start, idx)
+
+                y_t = logic_layer_cuda(x_t, a_idx, b_idx, w, csr)  # (OC*node_count, B*L)
+                cur = y_t.reshape(OC, node_count, B, L)  # (OC, node_count, B, L)
+
+                node_ptr += node_count
+                width = node_count
+
+            # Root: (OC, 1, B, L) -> (B, OC, L)
+            y = cur.squeeze(1).permute(2, 0, 1).contiguous()
+
+            H_padded = H + 2 * self.padding
+            W_padded = W + 2 * self.padding
+            H_out = (H_padded - kh) // self.stride + 1
+            W_out = (W_padded - kw) // self.stride + 1
+            return y.reshape(B, OC, H_out, W_out)
 
         # Compute tree bottom-up. We store logits in "level order" from bottom to top:
         # first num_leaves/2 nodes, then /4, ..., root.
