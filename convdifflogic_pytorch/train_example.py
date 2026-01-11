@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import replace, dataclass
+
+from typing import Optional, Tuple, Dict, List
+import time
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -16,10 +20,84 @@ from .models import (
     LogicTreeNetMNISTConfig,
 )
 
+# -----------------------------
+# Benchmark (speed)
+# -----------------------------
+@torch.no_grad()
+def benchmark_inference(
+    model: nn.Module,
+    device: torch.device,
+    batch_size: int = 256,
+    iters: int = 50,
+    warmup: int = 10,
+    input_size: Tuple[int, int, int] = (3, 32, 32),
+) -> Tuple[float, float]:
+    """
+    반환:
+      - avg_latency_ms (한 iteration에서 batch 1회 forward)
+      - throughput (images/sec)
+    """
+    model.eval()
+    x = torch.randn(batch_size, *input_size, device=device)
+
+    # warmup
+    for _ in range(warmup):
+        model(x)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    times = []
+    for _ in range(iters):
+        if device.type == "cuda":
+            starter = torch.cuda.Event(enable_timing=True)
+            ender = torch.cuda.Event(enable_timing=True)
+            starter.record()
+            model(x)
+            ender.record()
+            torch.cuda.synchronize()
+            times.append(starter.elapsed_time(ender))  # ms
+        else:
+            t0 = time.perf_counter()
+            model(x)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000.0)
+
+    avg_ms = sum(times) / len(times)
+    thr = batch_size * 1000 / avg_ms
+    return avg_ms, thr
+
+def bytes_to_mib(nbytes: int) -> float:
+    return nbytes / (1024 ** 2)
+
+
+def count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+def count_buffers(model: nn.Module) -> int:
+    sd_keys = model.state_dict().keys()
+    return sum(b.numel() for name, b in model.named_buffers() if name in sd_keys)
+
+
+def param_bytes(model: nn.Module) -> int:
+    # 실제 dtype(half/float) 기준 파라미터 메모리
+    return sum(p.numel() * p.element_size() for p in model.parameters())
+
+def buffer_bytes(model: nn.Module) -> int:
+    sd_keys = model.state_dict().keys()
+    return sum(b.numel() * b.element_size() for name, b in model.named_buffers() if name in sd_keys)
 
 def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
     return (logits.argmax(dim=-1) == y).float().mean().item()
 
+# -----------------------------
+# Config
+# -----------------------------
+@dataclass
+class CFG:
+    # ---------- Benchmark ----------
+    bench_batch: int = 256
+    bench_iters: int = 50
+    bench_warmup: int = 10
 
 def main():
     p = argparse.ArgumentParser()
@@ -93,6 +171,7 @@ def main():
         if eff != int(getattr(cfg, "outputs_per_class", eff)):
             print(f"[info] outputs_per_class was increased to {eff} to satisfy connectivity constraints")
 
+    best_acc = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
 
@@ -159,16 +238,34 @@ def main():
 
         test_acc = test_correct / max(test_seen, 1)
 
+        if best_acc < test_acc:
+            best_acc = test_acc
+
         # Use tqdm-friendly printing.
         msg = (
             f"Epoch {epoch:03d} | "
             f"train loss {train_loss:.4f} | train acc {train_acc:.4f} | "
-            f"test acc {test_acc:.4f}"
+            f"test acc {test_acc:.4f} | best acc {best_acc:.4f}" 
         )
         if args.tqdm:
             tqdm.write(msg)
         else:
             print(msg)
+
+    cfg = CFG()
+
+
+    print("\n[C-LGN] Params:", f"{count_params(model):,}")
+    print("[C-LGN] Buffers:", f"{count_buffers(model):,}")
+    print("[C-LGN] Param bytes:", f"{bytes_to_mib(param_bytes(model)):.2f} MiB")
+    print("[C-LGN] Buffer bytes:", f"{bytes_to_mib(buffer_bytes(model)):.2f} MiB")
+    clgn_ms, clgn_thr = benchmark_inference(
+        model, device,
+        batch_size=cfg.bench_batch,
+        iters=cfg.bench_iters,
+        warmup=cfg.bench_warmup
+    )
+    print(f"[C-LGN] Inference: {clgn_ms:.3f} ms / batch({cfg.bench_batch}), {clgn_thr:.1f} img/s")
 
 
 if __name__ == "__main__":

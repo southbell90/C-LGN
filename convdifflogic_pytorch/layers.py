@@ -126,6 +126,11 @@ class DifferentiableLogicLayer(nn.Module):
         gate_probs = logits_to_gate_probs(self.logits, training=self.training)  # (out_dim, 16)
         gate_probs = gate_probs.unsqueeze(0)  # (1, out_dim, 16)
         return bin_op_s(a, b, gate_probs)
+    
+    def removeParam(self):
+        self.w = self.logits.argmax(-1).to(torch.uint8)
+        self.register_buffer("w", self.w)
+        self.logits = None
 
 
 class GroupSum(nn.Module):
@@ -227,7 +232,6 @@ class LogicTreeConv2d(nn.Module):
         # --- Precompute tree-level pairwise connections for the CUDA fast path ---
         # Each tree level is a grouped 2-input logic-gate layer with a deterministic
         # "(0,1), (2,3), ..." pairing within each output channel.
-        #
         # The fused CUDA kernel expects a CSR adjacency representation for the backward.
         width = self.num_leaves
         for level in range(self.tree_depth):

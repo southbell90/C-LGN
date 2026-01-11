@@ -34,7 +34,7 @@ class LogicTreeNetCIFARConfig:
     # Input binarization thresholds for small models (2-bit precision => 3 thresholds).
     input_thresholds: Tuple[float, ...] = (0.25, 0.5, 0.75)
     # Softmax temperature used in the final GroupSum (controls logit scale).
-    tau: float = 20.0
+    tau: float = 100.0
     # Convolutional layer kernel size (paper uses 3x3).
     conv_kernel: Tuple[int, int] = (3, 3)
     conv_padding: int = 1
